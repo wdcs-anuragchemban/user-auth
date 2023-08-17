@@ -1,13 +1,11 @@
 use actix_web::web::Data;
 use actix_web::{App, HttpServer};
-// use config::Config;
 use diesel::r2d2::{self, ConnectionManager, Pool, PooledConnection};
 use diesel::PgConnection;
 use dotenv::dotenv;
 use std::env;
 use std::io::Result;
 
-// mod config;
 mod jwt_auth;
 mod model;
 mod response;
@@ -21,8 +19,6 @@ pub type DBConnection = PooledConnection<ConnectionManager<PgConnection>>;
 #[actix_web::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-
-    // let config = Config::init();
 
     let database_url = env::var("DATABASE_URL").expect("could not read DATABASE_URL");
     let db_connection = ConnectionManager::<PgConnection>::new(database_url);

@@ -1,19 +1,18 @@
 use actix_web::web::{self, Data, Json};
 use actix_web::{get, post, HttpResponse};
-use diesel::result::Error;
+use chrono::format;
+use diesel::result::Error::{self, NotFound};
 
 use bcrypt::{verify, DEFAULT_COST};
 use diesel::prelude::*;
 use diesel::{ExpressionMethods, Insertable, Queryable, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use std::env;
-use uuid::Uuid;
 
 use super::schema::users;
 use crate::jwt_auth::JwtMiddleware;
-use crate::response::{CustomError, ResponseLogin, ResponseRegister, UserData, UserDetail};
+use crate::response::{CustomError, StatusResponse, UserDetail};
 use crate::{token, DBConnection, DBPool};
-use std::str::FromStr;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct User {
@@ -74,24 +73,54 @@ impl UserDB {
     }
 }
 
-pub fn create_user(userdb: UserDB, conn: &mut DBConnection) -> Result<ResponseRegister, Error> {
+pub fn create_user(user: User, conn: &mut DBConnection) -> StatusResponse {
     use crate::schema::users::dsl::*;
 
-    let user = userdb.to_user_details();
-    let _ = diesel::insert_into(users).values(&userdb).execute(conn);
+    if user.password.len() < 8 || user.password.len() > 15 {
+        return StatusResponse {
+            status: "FAILED".to_string(),
+            message: "Password must be between 8 and 15 character long.".to_string(),
+        };
+    };
 
-    Ok(ResponseRegister {
-        result: Some(UserData { userdata: user }),
-        status: "SUCCESS".to_string(),
-        message: "User successfully registered".to_string(),
-    })
+    let _ = match users.filter(email.eq(&user.email)).first::<UserDB>(conn) {
+        Ok(_) => {
+            return StatusResponse {
+                status: "FAILED".to_string(),
+                message: "User with similar email found".to_string(),
+            };
+        }
+        Err(NotFound) => {
+            let userdb = user.to_db_user();
+            match diesel::insert_into(users).values(&userdb).execute(conn) {
+                Ok(res) => {
+                    return StatusResponse {
+                        status: "SUCCESS".to_string(),
+                        message: "User successfully registered".to_string(),
+                    }
+                }
+                Err(e) => {
+                    return StatusResponse {
+                        status: "FAILED".to_string(),
+                        message: format!("Failed to insert into table, {}", e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return StatusResponse {
+                status: "FAILED".to_string(),
+                message: format!("Error while fetching existing database , {}", e),
+            }
+        }
+    };
 }
 
 pub fn authenticate_user(user: &LoginUser, user_with_password: LoginUser) -> bool {
     verify(&user.password, &user_with_password.password).unwrap()
 }
 
-pub fn login_user(user: LoginUser, conn: &mut DBConnection) -> Result<ResponseLogin, CustomError> {
+pub fn login_user(user: LoginUser, conn: &mut DBConnection) -> StatusResponse {
     use crate::schema::users::dsl::*;
 
     let user_with_password = match users
@@ -99,17 +128,23 @@ pub fn login_user(user: LoginUser, conn: &mut DBConnection) -> Result<ResponseLo
         .select((email, password))
         .first::<LoginUser>(conn)
     {
-        Ok(res) => Ok(res),
-        Err(_) => Err(Error::NotFound),
+        Ok(res) => res,
+        Err(_) => {
+            return StatusResponse {
+                status: "FAILED".to_string(),
+                message: "No user found".to_string(),
+            }
+        }
     };
 
-    println!("{:?}", user_with_password);
-
-    let auth = authenticate_user(&user, user_with_password.unwrap());
+    let auth = authenticate_user(&user, user_with_password);
 
     if !auth {
-        return Err(CustomError::InvalidPassword);
-    }
+        return StatusResponse {
+            status: "FAILED".to_string(),
+            message: "Invalid Password".to_string(),
+        };
+    };
 
     let ttl = env::var("ACCESS_TOKEN_MAXAGE").expect("FAILED to fetch value");
     let ttl = ttl.parse::<i64>().unwrap();
@@ -117,16 +152,24 @@ pub fn login_user(user: LoginUser, conn: &mut DBConnection) -> Result<ResponseLo
 
     let access_token = match token::generate_jwt_token(user.email, ttl, private_key) {
         Ok(access_token) => access_token,
-        Err(_) => return Err(CustomError::FailedToGenerateAccessToken),
+        Err(_) => {
+            return StatusResponse {
+                status: "FAILED".to_string(),
+                message: "Failed to generate access token".to_string(),
+            }
+        }
     };
 
-    Ok(ResponseLogin {
+    StatusResponse {
         status: "SUCCESS".to_string(),
         message: access_token,
-    })
+    }
 }
 
-pub fn get_user_data(user_email: String, conn: &mut DBConnection) -> Result<UserDetail, CustomError> {
+pub fn get_user_data(
+    user_email: String,
+    conn: &mut DBConnection,
+) -> Result<UserDetail, CustomError> {
     use crate::schema::users::dsl::*;
 
     let user_details = match users
@@ -145,13 +188,11 @@ pub fn get_user_data(user_email: String, conn: &mut DBConnection) -> Result<User
 async fn register(data: Json<User>, pool: Data<DBPool>) -> HttpResponse {
     let mut conn = pool.get().expect("Cannot create connection");
 
-    if data.password.len() < 8 || data.password.len() > 15 {
-        // return Err(CustomError::InvalidPassword);
-        return HttpResponse::ExpectationFailed().json("Invalid Password");
-    }
+    let temp_data = serde_json::to_string(&data).unwrap();
+    let data: User = serde_json::from_str(&temp_data).unwrap();
 
-    let user = web::block(move || create_user(data.to_db_user(), &mut conn)).await;
-    let res = user.unwrap().unwrap();
+    let user = web::block(move || create_user(data, &mut conn)).await;
+    let res = user.unwrap();
 
     HttpResponse::Ok().json(res)
 }
@@ -163,13 +204,11 @@ async fn login(data: Json<LoginUser>, pool: Data<DBPool>) -> HttpResponse {
     let temp_data = serde_json::to_string(&data).unwrap();
     let login_data = serde_json::from_str(&temp_data).unwrap();
 
-    let user = web::block(move || login_user(login_data, &mut conn)).await;
+    let user = web::block(move || login_user(login_data, &mut conn))
+        .await
+        .unwrap();
 
-    match user {
-        Ok(res) => HttpResponse::Ok().json(res.unwrap()),
-        Err(err) => HttpResponse::BadRequest()
-            .json(serde_json::json!({"status": "FAILED", "message": format!("{:?}", err)})),
-    }
+    HttpResponse::Ok().json(user)
 }
 
 #[get("/dashboard")]

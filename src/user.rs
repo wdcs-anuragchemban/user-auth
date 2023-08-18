@@ -1,7 +1,7 @@
 use actix_web::web::{self, Data, Json};
 use actix_web::{get, post, HttpResponse};
-use chrono::format;
 use diesel::result::Error::{self, NotFound};
+use regex::Regex;
 
 use bcrypt::{verify, DEFAULT_COST};
 use diesel::prelude::*;
@@ -76,6 +76,14 @@ impl UserDB {
 pub fn create_user(user: User, conn: &mut DBConnection) -> StatusResponse {
     use crate::schema::users::dsl::*;
 
+    let valid_email = validate_email(&user.email);
+    if !valid_email {
+        return StatusResponse {
+            status: "FAILED".to_string(),
+            message: "Invalid email".to_string(),
+        };
+    };
+
     if user.password.len() < 8 || user.password.len() > 15 {
         return StatusResponse {
             status: "FAILED".to_string(),
@@ -120,8 +128,21 @@ pub fn authenticate_user(user: &LoginUser, user_with_password: LoginUser) -> boo
     verify(&user.password, &user_with_password.password).unwrap()
 }
 
+fn validate_email(email: &str) -> bool {
+    let email_regex = Regex::new(r"^([\w-]+[\.]*)+[\w-]+@([\w-]+\.)+[\w-]{2,4}$").unwrap();
+    email_regex.is_match(email)
+}
+
 pub fn login_user(user: LoginUser, conn: &mut DBConnection) -> StatusResponse {
     use crate::schema::users::dsl::*;
+
+    let valid_email = validate_email(&user.email);
+    if !valid_email {
+        return StatusResponse {
+            status: "FAILED".to_string(),
+            message: "Invalid email".to_string(),
+        };
+    };
 
     let user_with_password = match users
         .filter(&email.eq(&user.email))
